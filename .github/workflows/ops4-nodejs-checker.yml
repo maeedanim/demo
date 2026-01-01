@@ -31,11 +31,19 @@ jobs:
         shell: bash
         run: |
           PROBE=$(git ls-files '*.ts' '*.tsx' '*.js' '*.jsx' | head -n 1 || echo 'package.json')
-          npx eslint --print-config "$PROBE" > ops4-eslint-config.json
+          npx eslint --print-config "$PROBE" > ops4-eslint-config.json 2>&1 || echo '{"rules":{}}' > ops4-eslint-config.json
 
       - name: Run npm audit (JSON)
         if: hashFiles('**/package.json') != ''
         run: npm audit --json > ops4-npm-audit.json || true
+
+      - name: Run npm outdated (JSON)
+        if: hashFiles('**/package.json') != ''
+        run: |
+          npm outdated --json > ops4-npm-outdated.json 2>&1 || true
+          if [ ! -s ops4-npm-outdated.json ]; then
+            echo '{}' > ops4-npm-outdated.json
+          fi
 
       - name: Normalize results (Node)
         shell: bash
@@ -167,7 +175,15 @@ jobs:
           node <<'NODE'
           const fs = require('fs');
 
-          const cfg = JSON.parse(fs.readFileSync('ops4-eslint-config.json','utf8'));
+          let cfg = { rules: {} };
+          try {
+            const configContent = fs.readFileSync('ops4-eslint-config.json', 'utf8');
+            if (configContent && configContent.trim()) {
+              cfg = JSON.parse(configContent);
+            }
+          } catch (e) {
+            console.log('Warning: Could not read or parse ops4-eslint-config.json, using empty rules');
+          }
           const rules = cfg.rules || {};
 
           const toLevel = (x) => {
@@ -332,3 +348,44 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPS4_TOKEN" \
             --data-binary @ops4-payload.json
+
+      - name: Normalize npm outdated → payload
+        if: hashFiles('**/package.json') != ''
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const readJSON = (p) => { try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch { return null; } };
+
+          const branch =
+            process.env.GITHUB_HEAD_REF ||
+            process.env.GITHUB_REF_NAME ||
+            (process.env.GITHUB_REF || '').replace(/^refs\/heads\//, '');
+
+          const outdated = readJSON('ops4-npm-outdated.json') || {};
+
+          const payload = {
+            repo: process.env.GITHUB_REPOSITORY,
+            sha: process.env.GITHUB_SHA,
+            runId: process.env.GITHUB_RUN_ID,
+            ref: process.env.GITHUB_REF,
+            branch: branch,
+            detectedAt: new Date().toISOString(),
+            outdated: outdated
+          };
+
+          fs.writeFileSync('ops4-outdated-payload.json', JSON.stringify(payload, null, 2));
+          console.log('Normalized npm outdated payload');
+          NODE
+
+      - name: POST npm outdated to Ops4
+        if: always()
+        env:
+          OPS4_URL: ${{ secrets.OPS4_URL }}
+          OPS4_TOKEN: ${{ secrets.OPS4_TOKEN }}
+        run: |
+          test -f ops4-outdated-payload.json || echo '{"outdated":{}}' > ops4-outdated-payload.json
+          curl -sS -X POST "$OPS4_URL/repository-issues/npm-outdated" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPS4_TOKEN" \
+            --data-binary @ops4-outdated-payload.json || true
