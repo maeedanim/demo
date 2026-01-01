@@ -332,4 +332,3 @@ jobs:
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $OPS4_TOKEN" \
             --data-binary @ops4-payload.json
-
