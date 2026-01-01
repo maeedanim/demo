@@ -1,0 +1,335 @@
+name: Ops4Team Scan (Node.js)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install deps
+        if: hashFiles('**/package.json') != ''
+        run: |
+          npm ci || npm i
+
+      - name: Run ESLint (JSON)
+        if: hashFiles('**/.eslintrc*') != ''
+        run: npx eslint . --ext .js,.jsx,.ts,.tsx -f json -o ops4-eslint.json || true
+
+      - name: Resolve ESLint config
+        shell: bash
+        run: |
+          PROBE=$(git ls-files '*.ts' '*.tsx' '*.js' '*.jsx' | head -n 1 || echo 'package.json')
+          npx eslint --print-config "$PROBE" > ops4-eslint-config.json
+
+      - name: Run npm audit (JSON)
+        if: hashFiles('**/package.json') != ''
+        run: npm audit --json > ops4-npm-audit.json || true
+
+      - name: Normalize results (Node)
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const crypto = require('crypto');
+
+          const branch =
+            process.env.GITHUB_HEAD_REF ||
+            process.env.GITHUB_REF_NAME ||
+            (process.env.GITHUB_REF || '').replace(/^refs\/heads\//, '');
+
+          const payload = {
+            repo: process.env.GITHUB_REPOSITORY,
+            sha: process.env.GITHUB_SHA,
+            runId: process.env.GITHUB_RUN_ID,
+            ref: process.env.GITHUB_REF,
+            branch: branch,
+            detectedAt: new Date().toISOString(),
+            issues: []
+          };
+          const fp = (s) => crypto.createHash('sha1').update(s).digest('hex');
+          const readJSON = (p) => { try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch { return null; } };
+
+          const eslint = readJSON('ops4-eslint.json') || [];
+          for (const f of eslint) {
+            for (const m of (f.messages || [])) {
+              payload.issues.push({
+                tool: 'eslint',
+                path: f.filePath,
+                
+                line: m.line || 1,
+                col: m.column || 1,
+                endLine: m.endLine || 1,
+                endColumn: m.endColumn || 1,
+                
+                title: m.ruleId ? `ESLint: ${m.ruleId}` : 'ESLint Issue',
+                description: m.message,
+                severity: (m.severity === 2) ? 'Error' : 'Warn',
+                ruleId: m.ruleId || 'eslint',
+                
+                nodeType: m.nodeType || '',
+                messageId: m.messageId || '',
+                source: m.source || '',
+                suggestions: m.suggestions || [],
+                
+                fingerprint: fp(`${f.filePath}:${m.ruleId}:${m.line}:${m.message}`),
+              });
+            }
+          }
+
+          fs.writeFileSync('ops4-payload.json', JSON.stringify(payload, null, 2));
+          console.log('Normalized issues:', payload.issues.length);
+          NODE
+
+      - name: Test (with coverage)
+        if: hashFiles('**/package.json') != ''
+        run: |
+          npx jest --coverage --coverageReporters='json-summary' --coverageReporters='lcov' || true
+
+      - name: Aggregate coverage
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          function findFiles(dir, name, acc=[]) {
+            for (const f of fs.readdirSync(dir, {withFileTypes:true})) {
+              const p = path.join(dir, f.name);
+              if (f.isDirectory()) { if (f.name !== 'node_modules') findFiles(p, name, acc); }
+              else if (f.isFile() && f.name === name) acc.push(p);
+            }
+            return acc;
+          }
+
+          const files = findFiles(process.cwd(), 'coverage-summary.json', []);
+          let totals = { lines:{covered:0,total:0}, statements:{covered:0,total:0}, branches:{covered:0,total:0}, functions:{covered:0,total:0} };
+
+          for (const file of files) {
+            const sum = JSON.parse(fs.readFileSync(file,'utf8')).total;
+            for (const k of ['lines','statements','branches','functions']) {
+              if (sum[k]) {
+                totals[k].covered += sum[k].covered || 0;
+                totals[k].total   += sum[k].total   || 0;
+              }
+            }
+          }
+
+          function pct({covered,total}) { return total ? +( (covered/total)*100 ).toFixed(1) : 0; }
+
+          const coverage = {
+            filesAnalyzed: files.length,
+            lines: pct(totals.lines),
+            statements: pct(totals.statements),
+            branches: pct(totals.branches),
+            functions: pct(totals.functions),
+            overall: pct({
+              covered: totals.lines.covered + totals.statements.covered + totals.branches.covered + totals.functions.covered,
+              total:   totals.lines.total   + totals.statements.total   + totals.branches.total   + totals.functions.total
+            })
+          };
+
+          fs.writeFileSync('ops4-coverage.json', JSON.stringify(coverage,null,2));
+          console.log('COVERAGE', coverage);
+
+          // Expose for later steps
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `COVERAGE=${coverage.overall}\n`);
+          NODE
+        id: cov
+
+      - name: Attach coverage to payload
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const payload = JSON.parse(fs.readFileSync('ops4-payload.json','utf8'));
+          try {
+            const cov = JSON.parse(fs.readFileSync('ops4-coverage.json','utf8'));
+            payload.coverage = cov;
+          } catch {}
+          fs.writeFileSync('ops4-payload.json', JSON.stringify(payload,null,2));
+          NODE
+
+      - name: Normalize → ops4-lint-rules.json
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+
+          const cfg = JSON.parse(fs.readFileSync('ops4-eslint-config.json','utf8'));
+          const rules = cfg.rules || {};
+
+          const toLevel = (x) => {
+            if (Array.isArray(x)) x = x[0];
+            if (x === 2 || x === 'error') return 'error';
+            if (x === 1 || x === 'warn') return 'warn';
+            return 'off';
+          };
+          const toOptions = (x) => Array.isArray(x) ? x[1] : undefined;
+
+          const list = Object.entries(rules).map(([id, setting]) => ({
+            id,
+            level: toLevel(setting),
+            options: toOptions(setting),
+          }));
+
+          const payload = {
+            repo: process.env.GITHUB_REPOSITORY,
+            sha: process.env.GITHUB_SHA,
+            ref: process.env.GITHUB_REF,
+            runId: process.env.GITHUB_RUN_ID,
+            detectedAt: new Date().toISOString(),
+            rules: list
+          };
+
+          fs.writeFileSync('ops4-lint-rules.json', JSON.stringify(payload,null,2));
+          console.log(`Normalized ${list.length} rules`);
+          NODE
+
+      - name: Attach rules to payload
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const payload = JSON.parse(fs.readFileSync('ops4-payload.json','utf8'));
+          try {
+            const rules = JSON.parse(fs.readFileSync('ops4-lint-rules.json','utf8'));
+            payload.rules = rules;
+          } catch {}
+          fs.writeFileSync('ops4-payload.json', JSON.stringify(payload,null,2));
+          NODE
+
+      - name: Normalize npm audit → append to payload
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const crypto = require('crypto');
+
+          const fp = (s) => crypto.createHash('sha1').update(s).digest('hex');
+          const readJSON = (p) => { try { return JSON.parse(fs.readFileSync(p,'utf8')); } catch { return null; } };
+
+          const payloadPath = 'ops4-payload.json';
+          const auditPath = 'ops4-npm-audit.json';
+
+          const payload = readJSON(payloadPath) || { issues: [] };
+          const audit = readJSON(auditPath);
+
+          if (!audit) {
+            fs.writeFileSync(payloadPath, JSON.stringify(payload, null, 2));
+            console.log('No npm audit data found; payload unchanged.');
+            process.exit(0);
+          }
+
+          const mapSeverity = (s) => {
+            const t = String(s || '').toLowerCase();
+            if (t === 'critical') return 'Critical';
+            if (t === 'high') return 'High';
+            if (t === 'moderate') return 'Moderate';
+            if (t === 'low') return 'Low';
+            return 'Moderate';
+          };
+
+          const vulns = audit.vulnerabilities || {};
+          let added = 0;
+
+          for (const [pkg, entry] of Object.entries(vulns)) {
+            const baseSeverity = mapSeverity(entry.severity);
+            const nodePath = (entry.nodes && entry.nodes[0]) || `node_modules/${pkg}`;
+            const range = entry.range || '';
+            const isDirect = !!entry.isDirect;
+
+            // entry.via can have strings (transitive) and/or objects (advisories)
+            const via = Array.isArray(entry.via) ? entry.via : [];
+
+            // If there are advisory objects, emit one issue per advisory
+            const advisoryObjs = via.filter(v => typeof v === 'object');
+            const transitiveStrs = via.filter(v => typeof v === 'string');
+
+            if (advisoryObjs.length) {
+              for (const adv of advisoryObjs) {
+                const ruleId = String(adv.source ?? adv.url ?? `${pkg}-advisory`);
+                const title = adv.title || `npm advisory for ${pkg}`;
+                const desc = [
+                  title,
+                  range ? `Range: ${range}` : '',
+                  isDirect ? 'Direct dependency' : 'Transitive dependency',
+                ].filter(Boolean).join(' — ');
+
+                payload.issues.push({
+                  tool: 'npm-audit',
+                  path: nodePath,
+                  line: 1,
+                  col: 1,
+                  title: `npm: ${pkg}`,
+                  description: desc,
+                  url: adv.url ? adv.url : '',
+                  severity: mapSeverity(adv.severity || baseSeverity),
+                  ruleId,
+                  fingerprint: fp(`${pkg}:${ruleId}:${range}:${isDirect}`),
+                  cwe: adv.cwe || [],
+                  cvss: adv.cvss || undefined,
+                  range,
+                  fixAvailable: !!entry.fixAvailable,
+                  isDirect,
+                });
+                added++;
+              }
+            } else {
+              // No advisory object; create a single aggregate issue per package
+              const transitiveNote = transitiveStrs.length ? ` via ${transitiveStrs.join(', ')}` : '';
+              const ruleId = `npm-${pkg}-aggregate`;
+              const desc = [
+                `Vulnerability in ${pkg}${transitiveNote}`,
+                range ? `Range: ${range}` : '',
+                isDirect ? 'Direct dependency' : 'Transitive dependency',
+              ].filter(Boolean).join(' — ');
+
+              payload.issues.push({
+                tool: 'npm-audit',
+                path: nodePath,
+                line: 1,
+                col: 1,
+                title: `npm: ${pkg}`,
+                description: desc,
+                url: '',
+                severity: baseSeverity,
+                ruleId,
+                fingerprint: fp(`${pkg}:${ruleId}:${range}:${isDirect}`),
+                cwe: [],
+                cvss: undefined,
+                range,
+                fixAvailable: !!entry.fixAvailable,
+                isDirect,
+              });
+              added++;
+            }
+          }
+
+          fs.writeFileSync(payloadPath, JSON.stringify(payload, null, 2));
+          console.log(`Appended ${added} npm-audit issue(s) to payload.`);
+          NODE
+
+      - name: POST results to Ops4
+        if: always()
+        env:
+          OPS4_URL: ${{ secrets.OPS4_URL }}
+          OPS4_TOKEN: ${{ secrets.OPS4_TOKEN }}
+        run: |
+          test -f ops4-payload.json || echo '{"issues":[]}' > ops4-payload.json
+          curl -sS -X POST "$OPS4_URL/repository-issues" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $OPS4_TOKEN" \
+            --data-binary @ops4-payload.json
+

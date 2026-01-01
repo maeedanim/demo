@@ -1,0 +1,21 @@
+services:
+  server:
+    build:
+      context: .
+    ports:
+      - 4000:4000
+    # env_file:
+    #   - .env
+    develop:
+      watch:
+        - path: package.json
+          target: ./usr/src/app/package.json
+          action: sync+restart
+        - path: package-lock.json
+          target: ./usr/src/app/package-lock.json
+          action: sync+restart
+        - path: ./src
+          target: ./usr/src/app/src
+          action: sync
+    volumes:
+      - .env:/usr/src/app/.env
